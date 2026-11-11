@@ -18,4 +18,3 @@ gcc xfw-monitor-x11.c $(pkg-config --cflags --libs x11 xrandr) -lcrypto -o xfw-m
 ./xfw-monitor-x11     # 输出每个已连接显示器信息
 ./xfw-monitor-x11 -c  # 输出 xfdesktop 所需的前置配置片段
 ```
-```
