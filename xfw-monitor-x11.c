@@ -1,0 +1,168 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <X11/Xlib.h>
+#include <X11/extensions/Xrandr.h>
+#include <openssl/sha.h>
+
+/* _xfw_monitor_build_identifier */
+static void build_id(char *out, const char *make, const char *model,
+                     const char *serial, const char *connector)
+{
+    char buf[1024];
+    size_t n = 0;
+    const char sep = '|';
+
+    if (make)   n += snprintf(buf + n, sizeof(buf) - n, "%s%c", make, sep);
+    if (model)  n += snprintf(buf + n, sizeof(buf) - n, "%s%c", model, sep);
+    if (serial) n += snprintf(buf + n, sizeof(buf) - n, "%s", serial);
+    if ((!make && !model) || !serial) {
+        if (!make && !model) buf[n++] = sep;
+        n += snprintf(buf + n, sizeof(buf) - n, "%s", connector);
+    }
+
+    unsigned char d[SHA_DIGEST_LENGTH];
+    SHA1((unsigned char *)buf, n, d);
+    for (int i = 0; i < SHA_DIGEST_LENGTH; i++) sprintf(out + i * 2, "%02x", d[i]);
+    out[SHA_DIGEST_LENGTH * 2] = '\0';
+}
+
+/* 复制 EDID 描述符文本（去尾部空白/换行/NUL） */
+static void copy_desc(unsigned char *d, char *out, size_t outlen)
+{
+    int n = 13;
+    while (n > 0 && (d[4 + n] == 0x0A || d[4 + n] == 0x00 || d[4 + n] == ' ')) n--;
+    if (n <= 0) { out[0] = '\0'; return; }
+    if ((size_t)n >= outlen) n = outlen - 1;
+    memcpy(out, d + 5, n);
+    out[n] = '\0';
+}
+
+static void parse_edid(unsigned char *e, unsigned long len,
+                       char *make, char *model, char *serial)
+{
+    make[0] = model[0] = serial[0] = '\0';
+    if (!e || len < 128) return;
+
+    unsigned short mfg = (e[8] << 8) | e[9];
+    make[0] = ((mfg >> 10) & 0x1f) + 'A' - 1;
+    make[1] = ((mfg >> 5) & 0x1f) + 'A' - 1;
+    make[2] = (mfg & 0x1f) + 'A' - 1;
+    make[3] = '\0';
+
+    snprintf(model, 64, "%04X", (e[17] << 8) | e[16]);
+
+    unsigned int sn = e[12] | (e[13] << 8) | (e[14] << 16) | ((unsigned)e[15] << 24);
+    if (sn) snprintf(serial, 64, "%u", sn);
+
+    for (int i = 0; i < 4; i++) {
+        unsigned char *d = e + 54 + i * 18;
+        if (d[0] || d[1]) continue;
+        if (d[3] == 0xFC) copy_desc(d, model, 64);
+        else if (d[3] == 0xFF) copy_desc(d, serial, 64);
+    }
+}
+
+typedef struct {
+    char connector[64], make[64], model[64], serial[64], desc[256], id[41];
+    int x, y, w, h;
+} Rec;
+
+static int enumerate(Display *dpy, Rec **out)
+{
+    Window root = DefaultRootWindow(dpy);
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+    if (!res) return 0;
+
+    int nmon = 0;
+    XRRMonitorInfo *mons = XRRGetMonitors(dpy, root, True, &nmon);
+    Rec *recs = calloc(nmon ? nmon : 1, sizeof(Rec));
+    int n = 0;
+
+    for (int i = 0; i < nmon; i++) {
+        RROutput oid = mons[i].outputs[0];
+        XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, oid);
+        if (!oi || oi->connection == RR_Disconnected || oi->crtc == None) {
+            if (oi) XRRFreeOutputInfo(oi);
+            continue;
+        }
+        char *conn = XGetAtomName(dpy, mons[i].name);
+
+        Atom at = XInternAtom(dpy, RR_PROPERTY_RANDR_EDID, False);
+        Atom type; int fmt;
+        unsigned long nb = 0, left = 0;
+        unsigned char *edid = NULL;
+        XRRGetOutputProperty(dpy, oid, at, 0, 256, False, False,
+                             AnyPropertyType, &type, &fmt, &nb, &left, &edid);
+
+        char mk[64] = "", md[64] = "", sr[64] = "";
+        if (edid && nb) { parse_edid(edid, nb, mk, md, sr); XFree(edid); }
+
+        Rec *r = &recs[n++];
+        snprintf(r->connector, sizeof(r->connector), "%s", conn);
+        snprintf(r->make,  sizeof(r->make),  "%s", mk);
+        snprintf(r->model, sizeof(r->model), "%s", md);
+        snprintf(r->serial,sizeof(r->serial),"%s", sr);
+        build_id(r->id, mk[0] ? mk : NULL, md[0] ? md : NULL, sr[0] ? sr : NULL, conn);
+
+        if (mk[0] && md[0] && sr[0]) snprintf(r->desc, sizeof(r->desc), "%s %s %s (%s)", mk, md, sr, conn);
+        else if (mk[0] && md[0])     snprintf(r->desc, sizeof(r->desc), "%s %s (%s)", mk, md, conn);
+        else if (mk[0])              snprintf(r->desc, sizeof(r->desc), "%s (%s)", mk, conn);
+        else                         snprintf(r->desc, sizeof(r->desc), "%s", conn);
+
+        r->x = mons[i].x; r->y = mons[i].y;
+        r->w = mons[i].width; r->h = mons[i].height;
+
+        XFree(conn);
+        XRRFreeOutputInfo(oi);
+    }
+
+    if (mons) XRRFreeMonitors(mons);
+    XRRFreeScreenResources(res);
+    *out = recs;
+    return n;
+}
+
+static void print_default(Rec *r, int n)
+{
+    for (int i = 0; i < n; i++, r++) {
+        printf("Connector : %s\n", r->connector);
+        printf("Make      : %s\n", r->make[0] ? r->make : "(null)");
+        printf("Model     : %s\n", r->model[0] ? r->model : "(null)");
+        printf("Serial    : %s\n", r->serial[0] ? r->serial : "(null)");
+        printf("Display   : %s\n", r->desc);
+        printf("ID        : %s\n", r->id);
+        printf("Geometry  : %dx%d+%d+%d\n", r->w, r->h, r->x, r->y);
+        //printf("---\n");
+    }
+}
+
+static void print_config(Rec *r, int n)
+{
+    printf("#\n# DO NOT EDIT THIS FILE WHILE XFDESKTOP IS RUNNING\n#\n");
+    printf("configs:\n- level: 0\n  monitors:\n");
+    for (int i = 0; i < n; i++, r++)
+        printf("  - id: \"%s\"\n    display_name: \"%s\"\n"
+               "    geometry:\n      x: %d\n      y: %d\n      width: %d\n      height: %d\n",
+               r->id, r->desc, r->x, r->y, r->w, r->h);
+    //printf("  icons:\n");
+}
+
+int main(int argc, char **argv)
+{
+    int cfg = 0;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-c")) cfg = 1;
+
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) { fprintf(stderr, "无法打开 X display\n"); return 1; }
+
+    Rec *recs = NULL;
+    int n = enumerate(dpy, &recs);
+    if (cfg) print_config(recs, n);
+    else     print_default(recs, n);
+
+    free(recs);
+    XCloseDisplay(dpy);
+    return 0;
+}
